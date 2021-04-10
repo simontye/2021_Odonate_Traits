@@ -1,0 +1,123 @@
+---
+title: "ranges"
+author: "SPT"
+date: "2021_04_23"
+output: github_document
+---
+
+### Background
+
+XXX
+
+### Folders in data/raw:
+
+- `XXX`: XXX
+
+### Files in data/raw:
+
+- `XXX`: XXX
+
+### Step 1: Load packages and data
+
+```{r: Load packages and data}
+# Reset global environment
+rm(list = ls())
+
+# Load packages
+library(easypackages)
+
+library(amt)
+
+
+libraries("rgbif", "bit64", "tidyverse", "maptools", "caret",
+          "dismo", "rgdal", "raster", "sp", "maps", "mapdata",
+          "jsonlite", "ENMTools", "RStoolbox", "MIAmaxent", "magicfor",
+          "sf", "pracma", "plyr", "dplyr", "CoordinateCleaner",
+          "ape", "devtools", "tibble", "phytools", "corHMM",
+          "BiocManager", "ggtree", "diversitree", "rJava",
+          "rmapshaper", "lwgeom", "data.table", "rmaxent",
+          "rgeos", "maddog")
+
+# Set working directory
+setwd("/Users/simontye/Documents/Research/Projects/Odonate_Traits/2021_Odonate_Traits/data")
+
+# Load a couple of raster files
+anax_junius <- raster("/Users/simontye/Documents/Research/Projects/Odonate_Traits/2021_Odonate_Traits/processed/rasters/Anax_junius_raster.grd")
+
+anax_walsinghami <- raster("/Users/simontye/Documents/Research/Projects/Odonate_Traits/2021_Odonate_Traits/processed/rasters/Anax_walsinghami_raster.grd")
+
+# Load a couple of polygon files
+anax_junius <- readOGR(dsn = "/Users/simontye/Documents/Research/Projects/Odonate_Traits/2021_Odonate_Traits/processed/polygons/Anax_walsinghami_raster.grd", layer = "SHAPEFILE")
+
+
+```
+
+### Step 2: Calculate range overlap
+
+```{r: Range overlap}
+
+## Calculate range overlap
+#overlap <- function(distribution???) # Load file
+#  overlap <- st_intersection(st, st.other)
+#  # But st.other needs to be each and every friggin thing
+
+
+#  species.range   <- polyarea(st)
+#  species.overlap <- polyarea(overlap)
+#  species.score   <- species.overlap / species.range # standardize amount of overlap by range size
+#}
+
+y <- intersect(anax_junius, anax_walsinghami)
+
+#
+#x <- brick(resample(b, y, method = "ngb"),resample(d, y, method = "ngb"))
+#x2 <- any(x, na.rm = TRUE)
+#
+library(maps)
+map(regions = "us")
+image(anax_junius, add = TRUE, col = "blue")
+image(anax_walsinghami, add = TRUE, col = "green")
+plot(extent(y), add = TRUE)
+#image(x2, add = TRUE, col = "red")
+
+
+hr_kde
+library(amt)
+
+#hr_overlap(anax_junius, anax_walsinghami, type = "vi", conditional = FALSE)
+
+int <- as_tibble(st_intersection(anax_junius, anax_walsinghami))
+
+
+# example data from raster package
+soil <- st_read(system.file("external/lux.shp", package="raster")) %>% 
+  # add in some fake soil type data
+  mutate(soil = LETTERS[c(1:6,1:6)]) %>% 
+  select(soil)
+
+# field polygons
+field <- c("POLYGON((6 49.75,6 50,6.4 50,6.4 49.75,6 49.75))",
+        "POLYGON((5.8 49.5,5.8 49.7,6.2 49.7,6.2 49.5,5.8 49.5))") %>% 
+  st_as_sfc(crs = st_crs(soil)) %>% 
+  st_sf(field = c('x','y'), geoms = ., stringsAsFactors = FALSE)
+
+# intersect - note that sf is intelligent with attribute data!
+pi <- st_intersection(soil, field)
+plot(soil$geometry, axes = TRUE)
+plot(field$geoms, add = TRUE)
+plot(pi$geometry, add = TRUE, col = 'red')
+
+# add in areas in m2
+attArea <- pi %>% 
+  mutate(area = st_area(.) %>% as.numeric())
+
+# for each field, get area per soil type
+attArea %>% 
+  as_tibble() %>% 
+  group_by(field, soil) %>% 
+  summarize(area = sum(area))
+
+
+```
+
+

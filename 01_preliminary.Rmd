@@ -1,0 +1,1206 @@
+---
+title: "preliminary"
+author: "SPT"
+date: "2021_04_23"
+output: github_document
+---
+
+### Step 1: Load packages and data
+
+```{r: Load packages and data}
+# Reset global environment
+rm(list = ls())
+
+# Load packages
+library(easypackages)
+libraries("rgbif", "bit64", "tidyverse", "maptools", "caret",
+          "dismo", "rgdal", "raster", "sp", "maps", "mapdata",
+          "jsonlite", "ENMTools", "RStoolbox", "MIAmaxent", "magicfor",
+          "sf", "pracma", "plyr", "dplyr", "CoordinateCleaner",
+          "ape", "devtools", "tibble", "phytools", "corHMM",
+          "BiocManager", "ggtree", "diversitree", "rJava",
+          "rmapshaper", "lwgeom", "data.table", "rmaxent",
+          "rgeos", "SSDM", "maddog", "OUwie", "mvMORPH")
+
+
+#install.packages("mvMORPH")
+#library(mvMORPH)
+
+# Install in-development packages
+#devtools::install_github("hoxo-m/magicfor")
+#devtools::install_github("thej022214/corHMM", force = TRUE)
+#devtools::install_github("simontye/maddog", force = TRUE)
+#devtools::install_github("johnbaums/rmaxent", force = TRUE)
+
+# Set working directory
+setwd("/Users/simontye/Documents/Research/Projects/Odonate_Traits/2021_Odonate_Traits")
+
+# Load phylogeny from Waller and Svensson, 2017 (https://onlinelibrary.wiley.com/doi/full/10.1111/evo.13302)
+tree <- ape::read.nexus("data/tree/tree.nex")
+
+# Load phenotypic trait data from Odonate Phenotypic Database (http://www.odonatephenotypicdatabase.org/shiny/shinyTree/)
+traits <- read.csv(file = "data/traits/opdb.csv", head = TRUE, sep = ",")
+
+# Load migration data from Tara
+migration <- read.csv(file = "data/traits/migration.csv", head = TRUE, sep = ",")
+
+# Load odonates of North America
+odonata.na <- read.csv(file = "data/odonata_northamerica.csv", head = TRUE, sep = ",")
+
+# Load occurrence data from GBIF (for key, go to GBIF: Odonata and request download)
+localities.gbif <- occ_download_get(key = "0222924-200613084148143",
+                                    overwrite = TRUE,
+                                    path = "./data/localities") %>%
+                   occ_download_import(distributions_download,
+                                       na.strings = c("", NA))
+
+# Load occurrence data from OdonataCentral
+localities.oc <- read.csv(file = "data/localities/OC_All_Records_2020-10-16.csv", head = TRUE, sep = ",")
+
+# Load climate data from WorldClim
+climate <- getData(name = "worldclim",
+                   var  = "bio",
+                   res  = 2.5,
+                   path = "")
+
+# Load lake data from HydroLAKES
+lakes <- raster("data/lakes/lakes.tif")
+
+# Load rivers data from HydroRIVERS
+rivers <- raster("data/rivers/rivers.tif")
+```
+
+### Step 2: Data manipulation
+
+```{r: Occurrence data}
+# Format odonate species of North America
+odonata.na <- odonata.na %>%
+  mutate(name    = paste0(genus, "_", species),
+         genus   = NULL,
+         species = NULL) %>%
+  dplyr::rename(species = name)
+
+# Remove abnormal localities in GBIF data (https://data-blog.gbif.org/post/gbif-filtering-guide/)
+localities.gbif <- localities.gbif %>%
+  setNames(tolower(names(.))) %>% # set lowercase column names to work with CoordinateCleaner
+  filter(occurrencestatus == "PRESENT") %>%
+  filter(!is.na(decimallongitude)) %>% 
+  filter(!is.na(decimallatitude)) %>% 
+  filter(!basisofrecord %in% c("FOSSIL_SPECIMEN","LIVING_SPECIMEN")) %>%
+  filter(!establishmentmeans %in% c("MANAGED", "INTRODUCED", "INVASIVE", "NATURALISED")) %>%
+  filter(year >= 1900) %>% 
+  filter(coordinateprecision > 0.01 | is.na(coordinateprecision)) %>% 
+  filter(coordinateuncertaintyinmeters < 10000 | is.na(coordinateuncertaintyinmeters)) %>%
+  filter(!coordinateuncertaintyinmeters %in% c(301, 3036, 999, 9999)) %>% 
+  filter(!decimallatitude == 0 | !decimallongitude == 0) %>%
+  mutate(species = sub(" ", "_", species)) %>% # add "_" between species to match tree data
+  dplyr::rename(latitude  = decimallatitude,
+                longitude = decimallongitude) %>%
+  distinct(species, latitude, longitude, .keep_all = FALSE) %>%
+  na.omit(.) %>%
+  .[as.character(.$species) %in% odonata.na$species, ]
+
+# Remove abnormal localities from OC data (https://data-blog.gbif.org/post/gbif-filtering-guide/)
+localities.oc <- localities.oc %>%
+  setNames(tolower(names(.))) %>% # set lowercase column names to work with CoordinateCleaner
+  dplyr::rename(decimallatitude  = latitude,
+                decimallongitude = longitude) %>%
+  filter(!is.na(decimallatitude)) %>% 
+  filter(!is.na(decimallongitude)) %>%
+  filter(!decimallatitude == 0 | !decimallongitude == 0) %>%
+  filter(status   == "Accepted") %>%
+  filter(!outlier == "TRUE" ) %>%
+  mutate(species = sub(" ", "_", scientific_name)) %>% # add "_" between species to match tree data
+  dplyr::rename(latitude  = decimallatitude,
+                longitude = decimallongitude) %>%
+  distinct(species, latitude, longitude, .keep_all = FALSE) %>%
+  na.omit(.) %>%
+  .[as.character(.$species) %in% odonata.na$species, ]
+
+# Join GBIF and OC occurrence data
+localities <- left_join(localities.gbif, localities.oc,
+                        by = c("species", "longitude", "latitude")) %>%
+  distinct(species, latitude, longitude, .keep_all = FALSE) %>%
+  na.omit(.) %>%
+  .[, c("species", "longitude", "latitude")]
+
+# Remove objects
+rm(localities.gbif, localities.oc)
+
+# Summarize occurrences by species
+localities.sum <- localities %>%
+  group_by(species) %>%
+  dplyr::summarize(occurrences = n())
+
+# Remove abnormal coordinates (first) and outliers (second)
+cleaned <- localities %>%
+  clean_coordinates(x = ., lon = "longitude", lat = "latitude", species = "species",
+                    tests = c("capitals", "centroids", "equal",
+                              "gbif", "institutions",
+                              "seas", "zeros"),
+                    capitals_rad = 2000, centroids_rad = 2000, inst_rad = 2000,
+                    value = "spatialvalid") %>%
+    filter(!.summary == "FALSE") %>%
+    distinct(species, latitude, longitude, .keep_all = FALSE) %>%
+  as.data.frame(.) %>%
+  cc_outl(x = ., lon = "longitude", lat = "latitude", species = "species",
+          method = "quantile", mltpl = 5, min_occs = 25) %>%
+  left_join(., localities.sum, by = "species") %>%
+  filter(!occurrences <= 25) %>%
+  mutate(occurrences = NULL) %>%
+  mutate(inside  = ifelse(longitude > -170 & longitude < -10 & latitude > 7, "yes", NA),
+         species = ifelse(inside == "yes", species, NA)) %>%
+  group_by(species) %>%
+  mutate(species = ifelse(inside == "yes", species, NA)) %>%
+  ungroup() %>%
+  filter(!is.na(species))
+
+# Test plot
+#plot(x = cleaned$longitude, y = cleaned$latitude)
+
+######################################################
+save.image("progress.R")
+######################################################
+```
+
+```{r: Environmental data}
+# Set environmental extent to occurrence area (with 10 deg buffer)
+geo.extent <- extent(x = c(floor(min(cleaned$longitude)   - 10),
+                           ceiling(max(cleaned$longitude) + 10),
+                           floor(min(cleaned$latitude)    - 10),
+                           ceiling(max(cleaned$latitude)  + 10)))
+  
+# Crop environmental data
+climate.extent <- crop(x = climate, y = geo.extent)
+lakes.extent   <- crop(x = lakes,   y = geo.extent)
+rivers.extent  <- crop(x = rivers,  y = geo.extent)
+
+# Pearson correlation tests for WorldClim variables (rho >= 0.7 are dropped)
+cor = layerStats(climate.extent, 'pearson', na.rm = T)
+cor.matrix = cor$'pearson correlation coefficient'
+cor.col <- findCorrelation(cor.matrix, cutoff = 0.7, names = TRUE)
+climate.extent = dropLayer(climate.extent, cor.col)
+
+# Perform PCA on remaining variables
+#climate.pca <- rasterPCA(climate, nComp = 4, scores = TRUE,
+#                         cor = TRUE, spca = TRUE, bylayer = TRUE,
+#                         filename = "/wc2-5/env_PCA.grd",
+#                         overwrite = TRUE)
+#
+
+# Join climate and lake data
+env <- addLayer(climate, lakes)
+env <- addLayer(env, rivers)
+
+# Remove original environmental data
+#rm(climate, lakes, rivers,
+#   climate.extent, lakes.extent, rivers.extent)
+```
+
+```{r: Traits}
+# Format trait data, add migration data, and reduce to species with occurrence and phylogenetic data
+traits <- traits %>%
+  dplyr::rename(specificEpithet = Species) %>%
+  dplyr::rename(species = GenusSpecies) %>%
+  mutate(species = sub(" ", "_", species)) %>%
+  dplyr::select(., -c("Genus", "specificEpithet")) %>%
+  left_join(., migration, by = "species") %>%
+  .[as.character(.$species) %in% cleaned$species,]
+
+# Remove migration data
+rm(migration, odonata.na)
+
+# Create master odonata dataframe
+odonata <- cleaned %>% # changed from cleaned
+  left_join(., traits, by = "species") %>%
+  drop_na(species) %>%
+  
+  # Body colors (warm, cool)
+  mutate(cat_color = ifelse(body_colors == "blue" | body_colors == "green" | body_colors == "violet", "cool",
+                            ifelse(body_colors == "red" | body_colors == "pink" | body_colors == "orange" | body_colors == "yellow", "warm", NA))) %>%
+  # Body colors (continuous color; 0 = blue, 1 = red)
+  mutate(cat_color_code = ifelse(body_colors == "violet", 0,
+                                 ifelse(body_colors == "blue", 0.2,
+                                        ifelse(body_colors == "green", 0.4,
+                                               ifelse(body_colors == "yellow", 0.6,
+                                                      ifelse(body_colors == "orange", 0.8,
+                                                             ifelse(body_colors == "red" | body_colors == "pink", 1, NA))))))) %>%
+
+  # Body color source (pigment, structural)
+  mutate(cat_color_source = ifelse(body_colortypes == "pigment", "pigment",
+                                   ifelse(body_colortypes == "pruinescence" | body_colortypes == "structural", "structural", NA))) %>%
+  
+  # Body pattern (simple, complex)
+  mutate(cat_pattern = ifelse(body_patterns == "striped" | body_patterns == "spotted", "complex",
+                              ifelse(body_patterns == "plain", "simple", NA))) %>%
+  
+  # Aquatic habitat (permanent, ephemeral)
+  mutate(cat_habitat = ifelse(aquatic_habitats == "lake" | aquatic_habitats == "pond", "permanent",
+                               ifelse(aquatic_habitats == "ephemeral" | aquatic_habitats == "wetland", "temporary", NA))) %>%
+  
+  # Migration (present, absent)
+  mutate(cat_migration =ifelse(migratory == "annual" | migratory == "partial", "yes", NA)) %>%
+  
+  dplyr::rename(family   = Family,
+                suborder = SubOrder) %>%         
+  group_by(species) %>%
+  mutate(id = group_indices(., species)) %>% # create unique identifier for each species
+  .[as.character(.$species) %in% cleaned$species,] %>%
+  .[as.character(.$species) %in% tree$tip.label,]
+
+# Counts of each trait by species to narrow search
+#odonata.sum <- odonata %>%
+#  group_by(species) %>%
+#  dplyr::summarize(family                                = family,
+#                   suborder                              = suborder,
+#                   #occurrences                           = occurrences,
+#                   body_colors                           = length(which(!is.na(body_colors))),
+#                   body_colortypes                       = length(which(!is.na(body_colortypes))),
+#                   body_patterns                         = length(which(!is.na(body_patterns))),
+#                   mate_guarding                         = length(which(!is.na(mate_guarding))),
+#                   flight_mode                           = length(which(!is.na(flight_mode))),
+#                   territoriality                        = length(which(!is.na(territoriality))),
+#                   continents                            = length(which(!is.na(continents))),
+#                   aquatic_habitats                      = length(which(!is.na(aquatic_habitats))),
+#                   climates                              = length(which(!is.na(climates))),
+#                   ecozones                              = length(which(!is.na(ecozones))),
+#                   habitat_openness                      = length(which(!is.na(habitat_openness))),
+#                   sex_polymorphisms                     = length(which(!is.na(sex_polymorphisms))),
+#                   geo_polymorphisms                     = length(which(!is.na(geo_polymorphisms))),
+#                   body_lengths                          = length(which(!is.na(body_lengths))),
+#                   forewing_lengths                      = length(which(!is.na(forewing_lengths))),
+#                   hindwing_lengths                      = length(which(!is.na(hindwing_lengths))),
+#                   has_wing_pigment                      = length(which(!is.na(has_wing_pigment))),
+#                   wing_pigment_extent_discrete          = length(which(!is.na(wing_pigment_extent_discrete))),
+#                   wing_pigment_extent_continuous        = length(which(!is.na(wing_pigment_extent_continuous))),
+#                   wing_pigment_pattern                  = length(which(!is.na(wing_pigment_pattern))),
+#                   wing_pigment_symmetry                 = length(which(!is.na(wing_pigment_symmetry))),
+#                   wing_pigment_dimorphism               = length(which(!is.na(wing_pigment_dimorphism))),
+#                   wing_pigment_color                    = length(which(!is.na(wing_pigment_color))),
+#                   wing_pigment_placement                = length(which(!is.na(wing_pigment_placement))),
+#                   wing_pigment_color_type               = length(which(!is.na(wing_pigment_color_type))),
+#                   female_has_wing_pigment               = length(which(!is.na(female_has_wing_pigment))),
+#                   female_wing_pigment_extent_discrete   = length(which(!is.na(female_wing_pigment_extent_discrete))),
+#                   female_wing_pigment_extent_continuous = length(which(!is.na(female_wing_pigment_extent_continuous))),
+#                   female_wing_pigment_placement         = length(which(!is.na(female_wing_pigment_placement))),
+#                   female_body_lengths                   = length(which(!is.na(female_body_lengths))),
+#                   female_hindwing_lengths               = length(which(!is.na(female_hindwing_lengths))),
+#                   female_forewing_lengths               = length(which(!is.na(female_forewing_lengths))),
+#                   cat_color                             = length(which(!is.na(cat_color))),
+#                   cat_color_source                      = length(which(!is.na(cat_color_source))),
+#                   cat_pattern                           = length(which(!is.na(cat_pattern))),
+#                   cat_habitat                           = length(which(!is.na(cat_habitat))),
+#                   cat_migration                         = length(which(!is.na(cat_migration)))) %>%
+#    distinct_all(.)
+
+# Subset trait data and bin body colors DO THIS FOR TREE ONLY
+###odonata <- odonata %>%
+###  dplyr::select(., species, cat_color, cat_color_code, cat_pattern) %>%
+###                #cat_pattern, cat_habitat) %>%
+###  na.omit(.) %>%
+###  mutate(cat_color        = ifelse(cat_color == "warm", 1, 0),
+###         cat_pattern      = ifelse(cat_pattern == "complex", 1, 0),
+###         species = as.factor(species)) %>%
+###  group_by(species) %>%
+###  dplyr::summarize(cat_color = mean(cat_color),
+###                   cat_color_code = mean(cat_color_code),
+###                   cat_pattern = mean(cat_pattern)) %>%
+###  dplyr::select(., species, cat_color_code) %>%
+###  na.omit(.)
+```
+
+### Step 4: Species distributions
+
+```{r: Species distributions}
+
+######################################################
+save.image("progress.R")
+######################################################
+
+###########################
+###### Option 1
+#sdmm()
+#
+#
+#SDM <- SSDM::modelling('MAXENT', Occurrences = genus, Env = climate,
+#                       Xcol = 'longitude', Ycol = 'latitude', verbose = FALSE)
+#
+#
+#
+#
+#?modelling
+#
+#
+#plot(SDM@projection, main = 'SDM\nfor Cryptocarya elliptica\nwith GLM algorithm')
+#
+#genus2 <- sdmData(train = genus, predictors = climate)
+#install.packages("SSDM")
+
+###########################
+###### Option 2 (best), mightve messed it up
+###########################
+# Save list of genera
+genera <- cleaned %>%
+  separate(., col = "species", into = "genus",
+  sep = "_") %>%
+  distinct(genus, .keep_all = FALSE)
+
+# Create test dataframe to use with MaxEnt for loop
+genus <- cleaned %>%
+  #group_by(species) %>%
+  subset(., species == "Anax_junius" | species == "Enallagma_boreale") %>%
+  #.[.$species %like% "Libellula_", ] %>%
+  #mutate(id = group_indices(., species)) %>% # create unique id by species
+  as.data.frame(.)
+
+# Calculate range size
+# Anax
+# Enallagma
+# Coenagrion
+
+for (i in unique(genus$species)) {
+  
+  # Subset coordinates
+  species <- genus %>%
+    subset(., species == i) %>%
+    dplyr::select(., "longitude", "latitude") %>%
+    .[, c("longitude", "latitude")]
+  
+  # Calculate extent
+  geo.extent <- extent(x = c(floor(min(species$longitude)   - 10),
+                             ceiling(max(species$longitude) + 10),
+                             floor(min(species$latitude)    - 10),
+                             ceiling(max(species$latitude)  + 10)))
+  
+  # Crop environmental data to buffered range
+  env.extent <- crop(x = climate, y = geo.extent)
+  
+  # MaxEnt
+  predict <- dismo::predict(object = maxent(x = env.extent, p = species),
+                            x      = env.extent, 
+                            ext    = geo.extent)
+  # Save raster
+  writeRaster(x = predict, filename = file.path(paste0("processed/rasters/",i,"_","raster")),
+              format = "raster", overwrite = TRUE)
+  
+  # Convert range prediction to polygon
+  polygon <- predict %>%
+    rasterToPolygons(., fun = function(x){x > 0.5}) %>% # keep above 0.3
+    ms_simplify(., keep = 0.5)
+  
+  # Save polygon
+  writeOGR(polygon, dsn = "processed/polygons",
+           layer = file.path(paste0(i,"_","polygon")),
+           driver = "ESRI Shapefile", overwrite_layer = TRUE)
+  
+  # Calculate range size
+  range <- polygon %>%
+    st_as_sf(.) %>%
+    st_combine(.) %>%
+    st_area(.) %>%
+    as.data.frame(.) %>%
+    dplyr::rename(range_size = ".") %>%
+    mutate(species = i) %>%
+    .[, c("species", "range_size")]
+  
+  # Save range size
+  write.table(range, file = file.path("processed/range_sizes.csv"),
+              append = TRUE, sep = ",", col.names = FALSE, row.names = FALSE)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+plot(SDM)
+## Calculate range overlap
+#overlap <- function(distribution???) # Load file
+#  overlap <- st_intersection(st, st.other)
+#  # But st.other needs to be each and every friggin thing
+#  species.range   <- polyarea(st)
+#  species.overlap <- polyarea(overlap)
+#  species.score   <- species.overlap / species.range # standardize amount of overlap by range size
+#}
+
+y <- intersect(b, d)
+#
+#x <- brick(resample(b, y, method = "ngb"),resample(d, y, method = "ngb"))
+#x2 <- any(x, na.rm = TRUE)
+#
+#library(maps)
+#map(regions = "australia")
+#image(d, add = TRUE, col = "blue")
+#image(b, add = TRUE, col = "green")
+#plot(extent(y), add = TRUE)
+#image(x2, add = TRUE, col = "red")
+
+```
+
+
+
+
+
+
+
+
+
+
+### Step X: Tree data
+
+```{r: Tree}
+# Trim tree and trait data to same species
+tree <- drop.tip(tree, tree$tip.label[!tree$tip.label %in% odonata$species])
+odonata <- odonata[as.character(odonata$species) %in% tree$tip.label,]
+
+
+
+
+
+
+odonata.traits
+test <- as.vector(odonata.traits$cat_color_code)
+
+fitBrownie<-brownie.lite(tree = tree.traits, x = test)
+
+fitOUM <- OUwie(phy = tree, data = odonata.traits, model = "OUM",simmap.tree = TRUE)
+
+
+fitBrownie
+
+# Create new dataframe to condense polymorphisms
+odonata.poly <- data.frame(species = unique(odonata.traits$species), cat_color = 0, cat_color_source = 0)
+
+# Condense polymorphisms
+for(species in unique(odonata.traits$species)){
+  tmpDat <- odonata.traits[odonata.traits$species %in% species, ]
+  tmpDat <- apply(tmpDat[2:3], 2, function(x) paste(levels(as.factor(unique(na.omit(x)))), collapse = "/"))
+  odonata.poly[odonata.poly$species == species, 2:3] <- tmpDat
+  odonata.poly$cat_color <- ifelse(odonata.poly$cat_color == "0/1", "1", odonata.poly$cat_color)
+  odonata.poly$cat_color_source <- ifelse(odonata.poly$cat_color_source == "0/1", "1", odonata.poly$cat_color_source)
+}
+
+# Trim tree and trait data to same species
+tree.traits <- drop.tip(tree, tree$tip.label[!tree$tip.label %in% odonata.poly$species])
+odonata.traits <- odonata.poly[as.character(odonata.poly$species) %in% tree$tip.label,]
+
+
+################# J ZONE
+ecomorphTree <- make.simmap(anoleTree, ecomorph, model="ER")
+
+
+
+
+
+
+
+
+
+
+
+# Combine tree and trait data into single list
+#test <- append(tree.colors, poly.colors)
+
+# ER model
+rate.1 <- corHMM(tree.traits, odonata.traits, rate.cat = 1, model = "ARD")
+
+# Plots
+plotMKmodel(rate.1)
+plotRECON(rate.1$phy, rate.1$states,
+          cex = 0.25, piecolors = c(blueraspberry, orangejubilee, purplerain, redgrapewine))
+
+# ARD model
+rate.2 <- corHMM(tree.colors, poly.colors[, c(1, 2)], rate.cat = 1, model = "ARD")
+
+# Plots
+plotMKmodel(rate.2)
+plotRECON(rate.2$phy, rate.2$states,
+          cex = 0.25, piecolors = c(blueraspberry, orangejubilee))
+
+# Plots
+plotMKmodel(rate.2)
+plotRECON(rate.2$phy, rate.2$states,
+          cex = 0.25, piecolors = c(blueraspberry, orangejubilee))
+
+```
+
+```{r: old function}
+############################################################
+# Distribution function
+distribution <- function(data) {
+  
+  # Remove species column from element
+  #data <- lapply(data, "[", -c(1))
+  
+  data <- data %>%
+    dplyr::select(c("latitude", "longitude")) #%>%
+  
+  #plyr::ldply(., data.frame) #%>%
+  #dplyr::rename(species = ".id")
+  
+  # Save species name
+  #species <- as.character(test$Acanthagrion_quadratum[[1,1]]) # save species
+
+  # Create extent
+  geo.extent <- extent(x = c(floor(min(data$longitude)   - 10),
+                             ceiling(max(data$longitude) + 10),
+                             floor(min(data$latitude)    - 10),
+                             ceiling(max(data$latitude)  + 10)))
+  
+  # Crop extent
+  env.extent <- crop(x = env, y = geo.extent)
+  
+  # Perform PCA to reduce variables
+  #env.pca <- rasterPCA(env, nComp = 4, scores = TRUE,
+  #                     cor = TRUE, spca = TRUE, bylayer = TRUE,
+  #                     filename = "data/wc2-5/env_PCA.grd", overwrite = TRUE)
+  
+  # Run model
+  env.model <- bioclim(x = env.extent, p = data)
+  predict   <- dismo::predict(object = env.model,
+                              x      = env.extent, 
+                              ext    = geo.extent)
+  # Convert to polygon
+  #poly  <- rasterToPolygons(predict, fun = function(x){x > 0}) # decide limiting probability for distribution
+  #sf    <- st_as_sf(poly) # convert to st
+  #sf    <- st_combine(sf) # merge polygon features
+  #range <- st_area(sf) # calculate range size
+
+  # Save output
+  return(list(env.model = env.model, predict = predict, poly = poly, sf = sf, range = range))
+  
+  # Name output by species
+  #assign(paste("out", species, sep="."), out)
+}
+
+
+##########################################################################################
+
+###### Combines everything into a single function
+# Need to iterate over species after the following:
+# Need to add transformation of predictors (raster to poly to sf?) 
+# Overlap with each species
+# Save area of overlap after each species
+# Sum total area of overlap for a single species
+# Standardize by range size
+
+# Try distribution model on single species w/ only lat and long
+#lapply(localities.test.2, distribution)
+#test <- as.data.frame(localities.test.2[1])
+#test <- melt(localities.test.2[1], level = 1)
+
+# Subset one species for trial run (add 26 for second species)
+#test <- localities.list[c(1, 2, 12, 26)]
+
+# Save species name
+# maybe quasiquote around "i" to iternate over all of the species names, or jsut save those
+#species <- test$"1"[[1, 2]]
+
+# Print number of elements iwthin a list
+#length (test)
+
+# Try lapply
+#lapply(unique(test$"id"]), distribution, test)
+
+# Species name but 1 needs to be i for the for loop or id in 
+#species <- test$"1"[[1, 2]]
+
+# Iterate over all of the species
+#for (i in length(test)) {
+#  test
+#  species <- as
+#}
+
+#species <- as.character(test$"26"[[1, 2]]) # save species name for file names
+
+#(unique(test))
+
+# Run distribution function
+a <- distribution(test)
+
+# Run model for each species
+#for (i in 1:XXX) {
+#  # Run distribution model
+#  distribution(i)
+#}
+
+# Iterate over all of the species
+#for (i in length(data$id)) {
+#  distrubtion(data)
+#  
+#}
+
+#test2 <- lapply(test, "[", -c(1))
+
+
+################# OVERLAP FUNCTION
+
+### Output these to a special folder and then pull the file names from that folder for the overlap.
+### Need to combine all the st files into a list
+
+
+
+### Once those are combined, run that list file through the following function
+
+
+# Need to send it a list with each distribution st file as itself
+overlap <- function(distribution???) # Load file
+  overlap <- st_intersection(st, st.other)
+  # But st.other needs to be each and every friggin thing
+  species.range   <- polyarea(st)
+  species.overlap <- polyarea(overlap)
+  species.score   <- species.overlap / species.range # standardize amount of overlap by range size
+}
+
+
+### Overlay options
+# polyarea(pol)
+# test.overlap <- st_intersection(test.aj, test.iv)
+
+```
+
+```{r: Notes}
+
+#test <-stack(climate.pca2$map)
+
+# Reduce resolution of climate data to match lake data
+#climate <- aggregate(climate, fact = 2)
+
+#### Save WorldClim variables as separate raster layers for MIAmaxent
+####for (i in 1:19) {
+####  writeRaster(x = climate@layers[[i]],
+####              format = "ascii",
+####              NAflag = -9999,
+####              filename = paste0("data/worldclim/",
+####                                names(climate@layers[[i]]),
+####                                ".asc"))
+####}
+###
+
+#### Manipulate rivers
+####shapefile_list <- lapply(file_list, read_sf)
+####st_transform(shapefile_list[[1]], "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")
+####blank <- raster(extent(-180, 180, -60, 90), res = 0.08333333)
+####river.af <- rasterize(shapefile_list[[1]], template)
+####writeRaster(river.af, file = "river_af.tif", format = "GTiff")
+###
+#### Rasterize lakes
+####lakes <- rasterize(x = lakes, y = template, filename = "lakes_raster.tif")
+###
+#### Compare resolutions to determine aggregation below
+###res(lakes)
+###res(climate)
+###dim(lakes)
+###
+#### Reduce resolution of climate data to match lake data
+####climate <- aggregate(climate, fact = 2)
+###
+#### Pearson correlation tests for WorldClim variables (rho >= 0.7 are dropped)
+###cor = layerStats(climate, 'pearson', na.rm = T)
+###cor.matrix = cor$'pearson correlation coefficient'
+###cor.col <- findCorrelation(cor.matrix, cutoff = 0.7, names = TRUE)
+###climate.2 = dropLayer(climate, cor.col)
+###
+#### Perform PCA on remaining variables (n = 7)
+####climate.pca <- rasterPCA(climate, nComp = 4, scores = TRUE,
+####                         cor = TRUE, spca = TRUE, bylayer = TRUE,
+####                         filename = "/wc2-5/env_PCA.grd", overwrite = TRUE)
+####
+###
+###
+
+#### Manipulate rivers
+####shapefile_list <- lapply(file_list, read_sf)
+####st_transform(shapefile_list[[1]], "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")
+####blank <- raster(extent(-180, 180, -60, 90), res = 0.08333333)
+####river.af <- rasterize(shapefile_list[[1]], template)
+####writeRaster(river.af, file = "river_af.tif", format = "GTiff")
+###
+#### Rasterize lakes
+####lakes <- rasterize(x = lakes, y = template, filename = "lakes_raster.tif")
+###
+
+###### Load global lakes from HydroLAKES
+#lakes <- readOGR(dsn = path.expand("lakes/"), layer = "HydroLAKES_polys_v10")
+
+# Load global lakes from HydroSHED
+# waterbodies = raster("data/waterbodies/WAT_2000.asc") # (http://www.fao.org/soils-portal/soil-survey/soil-maps-and-databases/harmonized-world-soil-database-v12/en/)
+#lakes <- readOGR(dsn = path.expand("data/lakes/"), layer = "HydroLAKES_polys_v10")
+
+
+# Format occurrence data from GBIF
+#localities.gbif <- localities.gbif %>%
+#  #dplyr::select(., c("gbifID", "identifier", "catalogNumber", "year", "month", "day", 
+#  #                   "countryCode", "stateProvince", "decimalLatitude", "decimalLongitude",
+#  #                   "coordinateUncertaintyInMeters", "taxonID", "species", "taxonRank", "taxonomicStatus",
+#  #                   "hasCoordinate", "hasGeospatialIssues", "level0Gid", "level0Name", "level1Gid",
+#  #                   "level1Name", "level2Gid", "level2Name", "level3Gid", "level3Name")) %>%
+#  dplyr::select(., c("species", "decimalLatitude", "decimalLongitude")) %>%
+#  dplyr::rename(decimallatitude  = "decimalLatitude",
+#                decimallongitude = "decimalLongitude") %>%
+#  mutate(species = sub(" ", "_", species)) %>% # add "_" between species to match tree data
+#  drop_na(c(decimallatitude, decimallongitude, species)) %>%
+#  distinct_at(., vars("species", "decimallatitude", "decimallongitude")) %>% # remove duplicate entries
+#  clean_coordinates(x = ., value = "clean") # clean coordinates
+
+# Format occurrence data from OC
+#localities.oc <- localities.oc %>%
+#  #dplyr::select(., c("sighting_id", "taxon_id", "scientific_name", "status", "life_stage",
+#  #                   "outlier", "latitude", "longitude")) %>%
+#  dplyr::rename(decimallatitude  = "latitude",
+#                decimallongitude = "longitude",
+#                species          = "scientific_name") %>%
+#  mutate(species = sub(" ", "_", species)) %>% # add "_" between species to match tree data
+#  drop_na(c(decimallatitude, decimallongitude, species)) %>%
+#  .[!(.$outlier == "TRUE" | .$status != "Accepted"), ] %>% # remove outliers and bad entries
+#  dplyr::select(., c("species", "decimallatitude", "decimallongitude")) %>%
+#  distinct_at(., vars("species", "decimallatitude", "decimallongitude")) %>% # remove duplicate entries
+#  clean_coordinates(x = ., value = "clean") # clean coordinates
+#
+## Join GBIF and OC occurrence data
+#localities <- rbind(localities.gbif, localities.oc) %>%
+#  distinct_at(., vars("species", "decimallatitude", "decimallongitude")) # remove duplicate entries
+
+#################################################################
+###### SPECIES DISTRIBUTIONS
+#################################################################
+
+# Subset coordinates for climate data
+a.juni <- odonata %>%
+  subset(., species == "Anax junius", select = c("latitude", "longitude")) %>%
+  .[, c("longitude", "latitude")]
+
+polyarea(a.juni$latitude, a.juni$longitude)
+
+# Subset coordinates for climate data
+i.vert <- odonata %>%
+  subset(., species == "Ischnura verticalis", select = c("latitude", "longitude")) %>%
+  .[, c("longitude", "latitude")]
+
+polyarea(i.vert$longitude, i.vert$latitude)
+
+# Subset coordinates for climate data
+i.posi <- odonata %>%
+  subset(., species == "Ischnura posita", select = c("latitude", "longitude")) %>%
+  .[, c("longitude", "latitude")]
+
+polyarea(i.posi$latitude, i.posi$longitude)
+
+# Save geographic extent of localities (added 10 degrees for safety net)
+max.lat.aj    <- ceiling(max(a.juni$latitude) + 10)
+min.lat.aj    <- floor(min(a.juni$latitude) - 10)
+max.lon.aj    <- ceiling(max(a.juni$longitude) + 10)
+min.lon.aj    <- floor(min(a.juni$longitude) - 10)
+geo.extent.aj <- extent(x = c(min.lon.aj, max.lon.aj, min.lat.aj, ceiling(max(a.juni$latitude) + 10)))
+
+# Save geographic extent of localities (added 10 degrees for safety net)
+max.lat.iv    <- ceiling(max(i.vert$latitude) + 10)
+min.lat.iv    <- floor(min(i.vert$latitude) - 10)
+max.lon.iv    <- ceiling(max(i.vert$longitude) + 10)
+min.lon.iv    <- floor(min(i.vert$longitude) - 10)
+geo.extent.iv <- extent(x = c(min.lon.iv, max.lon.iv, min.lat.iv, max.lat.iv))
+
+# Save geographic extent of localities (added 10 degrees for safety net)
+max.lat.ip    <- ceiling(max(i.vert$latitude) + 10)
+min.lat.ip    <- floor(min(i.vert$latitude) - 10)
+max.lon.ip    <- ceiling(max(i.vert$longitude) + 10)
+min.lon.ip    <- floor(min(i.vert$longitude) - 10)
+geo.extent.ip <- extent(x = c(min.lon.ip, max.lon.ip, min.lat.ip, max.lat.ip))
+
+# Remove layers from WorldClim
+#currentEnv = dropLayer(currentEnv, c("bio2", "bio3", "bio4", "bio10", "bio11", "bio13", "bio14", "bio15"))
+#futureEnv  = dropLayer(futureEnv,  c("bio2", "bio3", "bio4", "bio10", "bio11", "bio13", "bio14", "bio15"))
+
+# Crop climate data to max geographic extent
+climate.aj <- crop(x = climate, y = geo.extent.aj)
+climate.iv <- crop(x = climate, y = geo.extent.iv)
+climate.ip <- crop(x = climate, y = geo.extent.ip)
+
+## Create PCA with two axes for WorldClim data
+#climate.pca <- raster.pca(climate.aj, 2)
+#
+#climate.pca2 <- rasterPCA(climate.aj, nComp = 4, scores = TRUE,
+#                         cor = TRUE, spca = TRUE, bylayer = TRUE,
+#                         filename = "data/wc2-5/PCA.grd", overwrite = TRUE)
+
+# Build species distribution model
+climate.model.aj <- bioclim(x = climate.aj, p = a.juni)
+climate.model.iv <- bioclim(x = climate.iv, p = i.vert)
+climate.model.ip <- bioclim(x = climate.ip, p = i.posi)
+
+# Predict presence from model
+predict.presence.aj <- dismo::predict(object = climate.model.aj, 
+                                   x      = climate.aj, 
+                                   ext    = geo.extent.aj)
+
+# Predict presence from model
+predict.presence.iv <- dismo::predict(object = climate.model.iv, 
+                                   x      = climate.iv, 
+                                   ext    = geo.extent.iv)
+
+# Predict presence from model
+predict.presence.ip <- dismo::predict(object = climate.model.ip, 
+                                   x      = climate.ip, 
+                                   ext    = geo.extent.ip)
+# Load map
+data(wrld_simpl)
+
+# Test AUC of climate model w/o PCA
+#testAUC(model = climate.model, transformations = climate.model.XXX$transformations, data = coordinates, plot = TRUE)
+
+# Plot base map
+plot(wrld_simpl, 
+     xlim = c(min.lon.aj, max.lon.aj),
+     ylim = c(min.lat.aj, max.lat.aj),
+     axes = TRUE, 
+     col = "grey95")
+
+# Add model probabilities
+#plot(predict.presence.aj, add = TRUE)
+plot(predict.presence.iv, add = TRUE)
+#plot(predict.presence.ip, add = TRUE)
+plot(overlap, add = TRUE)
+
+# Redraw those country borders
+plot(wrld_simpl, add = TRUE, border = "grey5")
+
+# Add original observations
+points(a.juni$longitude, a.juni$latitude, col = "red", pch = 20, cex = 0.15)
+box()
+
+#### Compute overlap between raster layers
+overlap <- intersect(predict.presence.aj, predict.presence.iv)
+overlap2 <- brick(resample(predict.presence.aj, overlap, method = "ngb"), resample(predict.presence.iv, overlap, method = "ngb"))
+overlap3 <- any(overlap2, na.rm = TRUE)
+
+pol.aj <- rasterToPolygons(predict.presence.aj, fun = function(x){x > 0})
+pol.iv <- rasterToPolygons(predict.presence.iv, fun = function(x){x > 0})
+
+test.aj <- st_as_sf(pol.aj)
+test.iv <- st_as_sf(pol.iv)
+
+crs(pol.aj)
+
+#plot(st_geometry(pi_sf))
+
+# Plot base map
+plot(wrld_simpl, 
+     xlim = c(min.lon.aj, max.lon.aj),
+     ylim = c(min.lat.aj, max.lat.aj),
+     axes = TRUE,
+     col = "grey95")
+
+plot(test.overlap, add = TRUE)
+
+##################################################################
+####### PSEUDO ABSENCES
+##################################################################
+#
+## Create pseudo-absence, or background, points
+## Use the bioclim data files for sampling resolution
+#bil.files <- list.files(path = "data/wc2-5", 
+#                        pattern = "*.bil$", 
+#                        full.names = TRUE)
+#
+## We only need one file, so use the first one in the list of .bil files
+#mask <- raster(bil.files[1])
+#
+## Randomly sample points (same number as our observed points)
+#background <- randomPoints(mask = mask,
+#                           n    = nrow(coordinates),      # Number of random points
+#                           ext  = geo.extent, # Spatially restricts sampling
+#                           extf = 1.25)             # Expands sampling a little bit
+#
+## Arbitrarily assign group 1 as the testing data group
+#testing.group <- 1
+#
+## Create vector of group memberships
+#group.presence <- kfold(x = coordinates, k = 5) # kfold is in dismo package
+#
+## Separate observations into training and testing groups
+#presence.train <- coordinates[group.presence != testing.group, ]
+#presence.test  <- coordinates[group.presence == testing.group, ]
+#
+## Repeat the process for pseudo-absence points
+#group.background <- kfold(x = background, k = 5)
+#background.train <- background[group.background != testing.group, ]
+#background.test  <- background[group.background == testing.group, ]
+#
+## Build a model using training data
+#model.climate2 <- bioclim(x = climate, p = presence.train)
+#
+## Predict presence from model
+#predict.presence <- dismo::predict(object = model.climate2, 
+#                                   x      = climate, 
+#                                   ext    = geo.extent)
+#
+## Use testing data for model evaluation
+#bc.eval <- evaluate(p     = presence.test,   # The presence testing data
+#                    a     = background.test, # The absence testing data
+#                    model = model.climate2,    # The model we are evaluating
+#                    x     = climate)    # Climatic variables for use by model
+#
+## Determine minimum threshold for "presence"
+#bc.threshold <- threshold(x = bc.eval, stat = "spec_sens")
+#
+##################################################################
+####### FINAL PLOT
+##################################################################
+#
+## Plot base map
+#plot(wrld_simpl, 
+#     xlim = c(min.lon, max.lon),
+#     ylim = c(min.lat, max.lat),
+#     axes = TRUE, 
+#     col = "grey95")
+#
+## Only plot areas where probability of occurrence is greater than the threshold
+#plot(predict.presence > bc.threshold, 
+#     add = TRUE, 
+#     legend = FALSE, 
+#     col = c(NA, "olivedrab"))
+#
+## And add those observations
+#points(x = coordinates$longitude, 
+#       y = coordinates$latitude, 
+#       col = "black",
+#       pch = "+", 
+#       cex = 0.6)
+#
+## Redraw those country borders
+#plot(wrld_simpl, add = TRUE, border = "grey5")
+#box()
+
+##################################################################
+####### ????
+##################################################################
+
+# Count of traits in OPDB to see if questions are answerable
+#test <- subset(traits, body_colors != "NA")
+#unique(test$species)
+#
+#na_count <-sapply(traits, function(species) sum(length(which(is.na(species)))))
+#
+#na_count <- data.frame(na_count)
+
+#hist(odonata$species)
+#
+# #2270 species
+#
+#test <- odonata %>%
+#  group_by(species) %>%
+#  summarize(
+#    species = species,
+#    count = length(species)) %>%
+#  distinct(.)
+#
+#test <- as.data.frame(test)
+#
+#ggplot() +
+#  geom_point(data = test, aes(x = species, y = count))
+#
+#hist(test$count)
+
+
+##########################################
+#nwk <- system.file("extdata", "sample.nwk", package="treeio")
+
+#tree <- read.tree(nwk)
+ggtree(tree, layout = "circular")
+
+
+
+gheatmap(tree2, data$family, offset=.8, width=.2,
+               colnames_angle=95, colnames_offset_y = .25) +
+    scale_fill_viridis_d(option = "D", name = "discrete\nvalue")
+
+dotTree(tree2, odonata.sum, standardize=TRUE, length = 3)
+
+
+
+library(ggnewscale)
+p2 <- p1 + new_scale_fill()
+gheatmap(p2, df2, offset=15, width=.3,
+         colnames_angle=90, colnames_offset_y = .25) +
+    scale_fill_viridis_c(option="A", name="continuous\nvalue")
+
+# Combine polymorphisms
+
+# there are many doubles in the dataset. find the polymorphism and create a new state
+PolyDat <- data.frame(sp = unique(dat$sp), black = 0, plain = 0, ephemeral = 0)
+for(sp in unique(dat$sp)){
+  
+  tmpDat <- dat[dat$sp %in% sp,]
+  tmpDat <- apply(tmpDat[2:4], 2, function(x) paste(levels(as.factor(unique(na.omit(x)))), collapse = "/"))
+  PolyDat[PolyDat$sp == sp, 2:4] <- tmpDat
+  PolyDat$black <- ifelse(PolyDat$black == "0/1", "1", PolyDat$black)
+  PolyDat$plain <- ifelse(PolyDat$plain == "0/1", "1", PolyDat$plain)
+  PolyDat$ephemeral <- ifelse(PolyDat$ephemeral == "0/1", "1", PolyDat$ephemeral)
+}
+
+# which of the PolyDat have empty spaces?
+PolyDat <- PolyDat[!apply(apply(PolyDat, 2, function(x) x == ""), 1, any),]
+PolyPhy <- drop.tip(phy, phy$tip.label[!phy$tip.label %in% PolyDat$sp])
+
+
+# test plot (ape)
+ape::plot.phylo(PolyPhy, edge.color = as.factor(PolyDat$ephemeral), cex = 0.5)
+
+# make sure phy and dataset are working with the same set of tips
+#PolyDat2 <- PolyDat[as.character(PolyDat$sp) %in% PolyPhy$tip.label,]
+#PolyPhy2 <- drop.tip(PolyPhy, PolyPhy$tip.label[!PolyPhy$tip.label %in% PolyDat$sp])
+#PolyPhy2 <- PolyPhy2[!as.character(PolyDat$sp) %in% PolyPhy$tip.label,]
+
+# create data matrix of traits
+#PolyPhy2$tip.state <- data.frame(PolyDat2[2:4])
+#PolyDat$black <- as.numeric(PolyDat$black)
+#PolyDat$plain <- as.numeric(PolyDat$plain)
+#PolyDat$ephemeral <- as.numeric(PolyDat$ephemeral)
+
+# create separate matrix
+#PolyDat2 <- matrix(PolyDat[1:4], ncol = 4, byrow = TRUE)
+#names(PolyDat2) <- c("tip.state", "black", "plain", "ephemeral")
+#PolyDat2$tip.state <- PolyDat$tip.state
+
+#class(PolyPhy)
+#class(PolyDat)
+#
+#obj <- phylo4d(PolyPhy, tip.data = PolyDat, match.data = FALSE)
+#
+#obj2 <- as(obj, "data.frame")
+#
+## make sure phy and dataset are working with the same set of tips
+#PolyPhy2 <- drop.tip(PolyPhy, PolyPhy$tip.label[!PolyPhy$tip.label %in% PolyDat$sp])
+#PolyDat2 <- PolyDat[as.character(PolyDat$sp) %in% PolyPhy$tip.label,]
+
+# test plot (diversitree)
+trait.plot(PolyPhy2, PolyPhy2$tip.state, cols = list(black = c("pink", "red"),
+                                      plain = c("lightblue", "blue"),
+                                      ephemeral = c("lightgreen", "green")),
+           lab = names(cols), str = 0:1, class = NULL,
+           type = "f", w = 1/50, legend = length(cols) > 1, cex.lab = .5,
+           font.lab = 3, cex.legend = .75, margin = 1/4,
+           check = TRUE, quiet = FALSE)
+```
+
+```{r: Van}
+#######################################################################################
+### van Proosdij, A.S.J., Sosef, M.S.M., Wieringa, J.J. and Raes, N. 2015.
+### Minimum required number of specimen records to develop accurate species distribution
+### models
+### Ecography ECOG-01509
+### Appendix 5: R script for simulated species definition for the virtual and for the
+### real African study area.
+#######################################################################################
+
+#######################################################################################
+#########################  SPECIES.PRESENCE FUNCTION  #################################
+#######################################################################################
+
+#######################################################################################
+#######################################################################################
+###  Written by Andr? S.J. van Proosdij (1,2) & Niels Raes (2), 2015
+###  1 Biosystematics Group, Wageningen University, the Netherlands
+###  2 Naturalis Biodiversity Center (Botany section), Leiden, the Netherlands
+###  Corresponding author: Andr? S.J. van Proosdij, andrevanproosdij at hotmail dot com
+#######################################################################################
+#######################################################################################
+
+# DESCRIPTION
+# The 'species.presence' function creates a habitat suitability and a presence/absence
+# map. Habitat suitability is defined as a multivariate normal function of the
+# environmental variables using the function dmvnorm() ('mvtnorm' package, Genz & al.,
+# 2014).
+# To generate presence/absence map, for each point is checked whether it is inside the
+# parameter space defined by the species multivariate respons to the variables. For
+# this, first the variables are converted into independent standard normal variables
+# using Choleski Decomposition implemented in the function chol(). Then, for each point
+# the chi-squared distance to the origin is calculated using the function qchisq()
+# ('stats' package, R Core Team, 2014), with the number of dimensions as degrees of
+# freedom. Points which distance does not exceed the threshold value are defined as
+# presence, other points are defined as absences. Here, the function is applied to
+# analysis using 2 variables, but it can be applied to more dimensions too.
+
+# ARGUMENTS
+# z       - The environmental variables (predictors) that are used to define the habitat
+#           suitability of each raster cell. This argument should be a RasterStack with
+#           RasterLayers for each environmental variable.
+# means   - The mean values for the variables of the bivariate normal distribution. This
+#           argument should be a vector.
+# sigma   - The variance-covariance matrix of the bivariate normal distribution. This
+#           argument should be a matrix.
+
+species.presence <- function(z, means, sigma) {
+  #######################################################################################
+  #########################  Calculate the density function #############################
+  #######################################################################################
+  
+  # Transform the RasterStack with predictors ('z') to a matrix, required by dmvnorm().
+  z1 <- as.matrix(as.data.frame(z))
+  # Calculate the habitat suitabiliy as function of 'z', 'means' and 'sigma' using the
+  # function dmvnorm() ('mvtnorm' package).
+  suitability <- dmvnorm(x = z1, mean = means, sigma = sigma)
+  
+  #######################################################################################
+  #########################  Calculate the presence and absence of the species  #########
+  #######################################################################################
+  
+  # Define the number of dimensions and threshold level defining presences and absences.
+  dim <- ncol(z1)
+  level <- 0.68
+  
+  # Convert the variabes into independent standard normal variables using Choleski
+  # Decomposition implemented in the function chol().
+  # First, set the mean values to '0' and get the distance of each point to the means.
+  compmeans <- matrix(means, nrow = nrow(z1), ncol = dim, byrow = TRUE)
+  pc <- z1 - compmeans
+  # Construct the covariance unit.
+  M <- t(chol(sigma))
+  ip <- t(solve(M) %*% t(pc))
+
+  # Determine B such that (rowSums(ip^2) < B) = level. Use the chi-squared distribution
+  # implemented in the function qchisq() ('stats' package, R Core Team, 2014), with the
+  # number of dimensions as degrees of freedom.
+  B <- qchisq(level, df = dim)
+  # Check for each point if it is located inside or outside the object.
+  inellipse <- rowSums(ip^2) < B
+  presence <- cbind(z1, inellipse)
+  presence <- presence[ ,"inellipse"]
+  
+  # When applied to 2 variabbles (dim = 2), view the result.
+  if(dim == 2)
+  {
+    plot(z1[ ,1], z1[ ,2])
+    ellipse2 <- ellipse(sigma, centre = means, level = level)
+    lines(ellipse2, col = 'red')
+  }
+  
+  #######################################################################################
+  #########################  Output  ####################################################
+  #######################################################################################
+  
+  # The output consists of a list containing a RasterLayer for the habitat suitability
+  # and a RasterLayer containing presences and absences represented by 1's and 0's.
+  r.presence <- r.suitability <- raster(z) # Create two rasters
+  values(r.suitability) <- suitability # Fill the raster with habitat suitability values
+  values(r.presence) <- presence # Fill the raster with presence/absence values
+  out.list <- list(r.suitability, r.presence)
+  names(out.list) <- c("suitability", "presence")
+  return(out.list)
+}
+
+#######################################################################################
+#########################  END OF CODE  ###############################################
+#######################################################################################
+```
